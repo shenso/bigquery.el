@@ -132,7 +132,8 @@
     "assert" "union"))
 
 (defconst googlesql-construct-clause-symbols
-  '("with" "from" "where" "group" "having" "qualify" "window" "on"))
+  '("with" "from" "where" "group" "having" "qualify" "window" "on" "order"
+    "limit" "partition"))
 
 (defconst googlesql-conjunction-symbols
   '("and" "or"))
@@ -142,15 +143,18 @@
     "over" "and" "or" "not"))
 
 (defconst googlesql-clause-symbol-alist
-  '((with    . differential-privacy-clause)
-    (from    . from-clause)
-    (where   . where-clause)
-    (group   . group-by-clause)
-    (having  . having-clause)
-    (qualify . qualify-clause)
-    (window  . window-clause)
-    (on      . on-clause)
-    (using   . using-clause)))
+  '((with      . differential-privacy-clause)
+    (from      . from-clause)
+    (where     . where-clause)
+    (group     . group-by-clause)
+    (having    . having-clause)
+    (qualify   . qualify-clause)
+    (window    . window-clause)
+    (on        . on-clause)
+    (using     . using-clause)
+    (order     . order-by-clause)
+    (partition . partition-by-clause)
+    (limit     . limit-clause)))
 
 (defun googlesql-symbol-regexp-opt (symbol-list)
   (rx-to-string `(seq symbol-start
@@ -208,12 +212,17 @@
     (window-clause               . 0)
     (on-clause                   . +)
     (using-clause                . +)
+    (order-by-clause             . 0)
+    (partition-by-clause         . 0)
+    (limit-clause                . 0)
     (cte-item                    . +)
     (from-item                   . +)
+    (window-spec-item            . +)
     (join-operation              . 0)
     (join-continuation           . 0)
     (join-continuation           . 0)
     (clause-bool-expression      . +)
+    (clause-list-item            . +)
     (expression-continuation     . 0)
     )
   "Offset rules used in indentation")
@@ -237,9 +246,7 @@
     (modify-syntax-entry ?` "\"" table)
     ;; symbols -> punctuation
     (modify-syntax-entry ?&         "." table)
-    (modify-syntax-entry '(?* . ?+) "." table)
-    (modify-syntax-entry ?-         "." table)
-    (modify-syntax-entry ?/         "." table)
+    (modify-syntax-entry ?+         "." table)
     (modify-syntax-entry '(?< . ?>) "." table)
     (modify-syntax-entry ?|         "." table)
     ;; punctuation -> symbols
@@ -647,6 +654,24 @@ nil otherwise."
             (googlesql-looking-at-arglist-p))
         nil))))
 
+(defun googlesql-inside-window-spec-p (&optional limit)
+  (unless limit
+    (setq limit (point-min)))
+
+  (save-excursion
+    (let ((paren (googlesql-syntax-context 'paren)))
+      (and paren
+           (progn
+             (goto-char paren)
+             (or
+              (save-excursion
+                (bigquery-safe
+                 (progn
+                   (backward-sexp)
+                   (looking-at-p (rx symbol-start "over" symbol-end)))
+                 nil))
+              (eq (car (googlesql-nearest-backward-clause limit)) 'window)))))))
+
 (defun googlesql-looking-at-differential-privacy-clause ()
   (save-excursion
     (let ((clause-parts `(?\(
@@ -701,8 +726,12 @@ of point and their anchor points."
          (context-after-boc-tok (save-excursion
                                   (goto-char context-boc-tok)
                                   (bigquery-safe (progn (forward-sexp) (point)) nil)))
-         (context-nearest-clause (when context-after-boc-tok
-                                     (googlesql-nearest-backward-clause context-after-boc-tok)))
+         (context-inside-window-spec (googlesql-inside-window-spec-p))
+         (context-nearest-clause-limit (if context-inside-window-spec
+                                           context-paren
+                                         context-after-boc-tok))
+         (context-nearest-clause (when context-nearest-clause-limit
+                                   (googlesql-nearest-backward-clause context-nearest-clause-limit)))
          (context-nearest-clause-sym (car context-nearest-clause))
          (context-nearest-clause-tok (cdr context-nearest-clause))
          (case-fold-search-prev case-fold-search)
@@ -727,7 +756,8 @@ of point and their anchor points."
         )
 
        ;; statement intros
-       ((= (point) context-bos-tok)
+       ((and (= (point) context-bos-tok)
+             (not context-inside-window-spec))
         (save-excursion
           (if context-paren
               (let ((sym (char-after)))
@@ -749,10 +779,14 @@ of point and their anchor points."
 
             (googlesql-skip-comment -1)
             (beginning-of-line)
-            (push `(topmost-intro . ,(point)) result-syntax))))
+            (push `(topmost-intro . ,(point)) result-syntax)))
+
+        (when (eq (char-after) ?\()
+          (push '(expr-block-open . nil) result-syntax)))
 
        ;; subqueries, set operators
-       ((= (point) context-boc-tok)
+       ((and (= (point) context-boc-tok)
+             (not context-inside-window-spec))
         (save-excursion
           (goto-char context-bos-tok)
           (push `(statement-construct . ,(googlesql-point boi)) result-syntax)))
@@ -799,14 +833,22 @@ of point and their anchor points."
              (or context-nearest-clause-tok context-boc-tok))
         (push
          (if (eq (point) join-start)
-             `(join-operation . ,(or context-nearest-clause-tok context-boc-tok))
+             (let ((anchor-clause context-nearest-clause))
+               (save-excursion
+                 ;; we ideally want to anchor on a FROM clause, but certainly
+                 ;; not an ON or USING clause
+                 (while (and anchor-clause (memq (car anchor-clause) '(on using)))
+                   (goto-char (cdr anchor-clause))
+                   (setq anchor-clause (googlesql-nearest-backward-clause context-paren))))
+               `(join-operation . ,(or (cdr anchor-clause) context-boc-tok)))
            `(join-continuation . ,join-start))
          result-syntax))
 
        ;; not a clause symbol, statement intro, subquery/set operation, and
        ;; contained by a boolean clause
        ((and context-nearest-clause
-             (memq context-nearest-clause-sym '(where having qualify on)))
+             (memq context-nearest-clause-sym '(where having qualify on))
+             (not (and context-paren (eq (char-after) ?\)))))
         (let (intro connected expr-start)
           (setq connected (looking-at-p googlesql-conjunction-symbol-regexp))
           (save-excursion
@@ -859,6 +901,11 @@ of point and their anchor points."
                  (push `(arglist-continuation . ,intro-anchor) result-syntax))
                 (t (push `(arglist-expr-continuation . ,cont-anchor)
                          result-syntax)))))
+
+       ;; window-spec close
+       ((and context-inside-window-spec context-paren (eq (char-after) ?\)))
+        (push `(window-spec-close . ,(googlesql-point boi context-paren))
+              result-syntax))
 
        ;; expression block close
        ((and context-paren (eq (char-after) ?\)))
@@ -938,9 +985,55 @@ of point and their anchor points."
                                                    context-nearest-clause-tok)))
            result-syntax)))
 
+       ((memq context-nearest-clause-sym '(group order partition))
+        (let ((scan-delim-end-pos (point))
+              intro delimited expr-start)
+          (setq connected (eq (char-after) ?,))
+          (save-excursion
+            (backward-sexp)
+            (when (looking-at-p (rx symbol-start "by" symbol-end))
+              (backward-sexp))
+            (setq intro     (= (point) context-nearest-clause-tok)
+                  delimited (googlesql-region-delimited-p (point)
+                                                          scan-delim-end-pos
+                                                          '(?,)
+                                                          (or context-paren 0))))
+          (if (or intro delimited)
+              (progn
+                (push `(clause-list-item . ,context-nearest-clause-tok)
+                      result-syntax)
+                (when (eq (char-after) ?\()
+                  (push '(expr-block-open . nil) result-syntax)))
+            (save-excursion
+              (while (and (> (point) context-nearest-clause-tok)
+                          (null expr-start))
+                (backward-char)
+                (when (or (and (eq (char-after) ?,)
+                               (eq context-paren
+                                   (googlesql-syntax-context 'paren)))
+                          (= (point) context-nearest-clause-tok))
+                  (if (= (point) context-nearest-clause-tok)
+                      (progn
+                        (skip-syntax-forward "w.")
+                        (googlesql-skip-comment 1)
+                        (when (looking-at-p (rx symbol-start "by" symbol-end))
+                          (skip-syntax-forward "w.")
+                          (googlesql-skip-comment 1)))
+                    (forward-char)
+                    (googlesql-skip-comment 1))
+                  (setq expr-start (googlesql-point boi)))))
+            (push `(expression-continuation . ,(or expr-start
+                                                   context-nearest-clause-tok))
+                  result-syntax))))
+
        ;; common table expression
        ((and (= context-bos-tok context-boc-tok) (eq context-bos-sym 'with))
         (push `(cte-item . ,(googlesql-point boi context-bos-tok))
+              result-syntax))
+
+       ;; inside a window-spec without a clause
+       ((and context-paren context-inside-window-spec)
+        (push `(window-spec-item . ,(googlesql-point boi context-paren))
               result-syntax))
 
        ;; inside an expression block without a construct
@@ -1014,13 +1107,13 @@ of point and their anchor points."
   :syntax-table googlesql-syntax-table
   (setq font-lock-defaults `(,googlesql-font-lock-keywords nil t nil))
   (setq indent-line-function #'googlesql-indent-line-function)
-  (setq electric-indent-chars (seq-union '(?\n ?\r ?\( ?\))
-                                         (mapcar
-                                          (lambda (elem)
-                                            (string-to-char (substring elem -1)))
-                                          (append googlesql-construct-symbols
-                                                  googlesql-construct-clause-symbols
-                                                  googlesql-conjunction-symbols
-                                                  googlesql-expr-block-predecessor-tokens)))))
+  (setq-local electric-indent-chars (seq-union '(?\n ?\r ?\( ?\))
+                                               (mapcar
+                                                (lambda (elem)
+                                                  (string-to-char (substring elem -1)))
+                                                (append googlesql-construct-symbols
+                                                        googlesql-construct-clause-symbols
+                                                        googlesql-conjunction-symbols
+                                                        googlesql-expr-block-predecessor-tokens)))))
 
 (provide 'bigquery)
